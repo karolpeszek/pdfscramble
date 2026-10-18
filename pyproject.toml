@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdfscramble"
+version = "0.1.0"
+description = "Shatter PDF text glyphs into Voronoi fragments; keep images and plots intact."
+requires-python = ">=3.9"
+dependencies = ["pypdfium2", "pypdf", "lxml", "shapely>=2.0", "reportlab", "rich", "pillow", "numpy", "scipy"]
+
+[project.scripts]
+pdfscramble = "pdfscramble:main"
+
+[tool.setuptools]
+py-modules = ["pdfscramble"]

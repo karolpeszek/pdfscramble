@@ -1,0 +1,9 @@
+pypdfium2
+pypdf
+lxml
+shapely>=2.0
+reportlab
+rich
+pillow
+numpy
+scipy

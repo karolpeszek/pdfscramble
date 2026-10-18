@@ -1,0 +1,6 @@
+#!/bin/sh
+# Launcher that doesn't depend on the editable install's .pth file
+# (Python 3.13+ skips .pth files with the macOS "hidden" flag, which
+# iCloud-synced folders keep re-applying).
+here="$(cd "$(dirname "$0")" && pwd)"
+exec "$here/.venv/bin/python" "$here/pdfscramble.py" "$@"
