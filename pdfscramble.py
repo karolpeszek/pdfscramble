@@ -1,11 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/local/bin/python3
 """
 pdfscramble — shatter every text glyph in a PDF into random Voronoi fragments
 while leaving images, plots and diagrams intact. Optionally embeds an invisible
 32-bit fingerprint for ownership tracking.
 
 Usage:
-    pdfscramble <input.pdf> <output.pdf> [--grid N] [--workers N] [--layers]
+    pdfscramble <input.pdf> <output.pdf> [--grid N] [--workers N] [--layers N]
                 [--fingerprint] [--seed N]
     pdfscramble --extract-fingerprint <pdf>
 
@@ -38,6 +38,7 @@ NSMAP = {None: SVG_NS, "xlink": XLINK_NS}
 
 DENSE_PAGE_3 = 2000         # above this many glyphs on a page: 3 pieces per glyph
 DENSE_PAGE_2 = 3000         # above this many glyphs on a page: 2 pieces per glyph
+LAYERS_MIN, LAYERS_MAX = 4, 16  # default range for the random number of text layers
 TARGET_FRAGMENTS = 6000     # per-page fragment budget
 USE_DEPTH_LIMIT = 64
 LARGE_RECT_PT = 50.0
@@ -1019,8 +1020,13 @@ def shatter_polygon_shape(poly, n_seeds, rng_seed, overlap=0.0):
     return frags or [_poly_to_d(poly)]
 
 
-def scramble_flat_svg(svg_text, base_seeds=9, seed=None):
+def scramble_flat_svg(svg_text, base_seeds=9, seed=None, n_layers=0):
     """Shatter eligible paths into Voronoi fragments.
+
+    With n_layers > 0 every fragment is assigned to one of n_layers stacked
+    layers (class "txt:<k>"). A glyph's fragments go to distinct layers
+    whenever it has no more fragments than there are layers, so no single
+    layer contains a whole glyph.
 
     Returns (svg_text, n_fragments, n_shatterable, method)."""
     root, clips, items = read_flat_svg(svg_text)
@@ -1067,6 +1073,10 @@ def scramble_flat_svg(svg_text, base_seeds=9, seed=None):
         def flush():
             if run:
                 rng.shuffle(run)
+                if n_layers:
+                    # group by layer (stable, so order within a layer stays
+                    # random) to keep layer switches in the stream to a minimum
+                    run.sort(key=lambda r: int(r[3].split(":")[1]))
                 out.extend(run)
                 run.clear()
 
@@ -1098,11 +1108,20 @@ def scramble_flat_svg(svg_text, base_seeds=9, seed=None):
                 "fill-rule": "evenodd",
             }
             biggest = max(s.area for s in shapes)
+            frags = []
             for shp in shapes:
                 ns = n_seeds if shp.area >= biggest else max(2, round(n_seeds * shp.area / biggest))
-                for fd in shatter_polygon_shape(shp, ns, rng.getrandbits(63), overlap):
-                    run.append(("path", fd, fstyle, "txt"))
-                    total += 1
+                frags.extend(shatter_polygon_shape(shp, ns, rng.getrandbits(63), overlap))
+            if n_layers:
+                k = min(len(frags), n_layers)
+                layers = rng.sample(range(n_layers), k) + [rng.randrange(n_layers) for _ in range(len(frags) - k)]
+                rng.shuffle(layers)
+                classes = [f"txt:{lay}" for lay in layers]
+            else:
+                classes = ["txt"] * len(frags)
+            for fd, c in zip(frags, classes):
+                run.append(("path", fd, fstyle, c))
+            total += len(frags)
             # keep any stroke the shape had (e.g. marker edges), drawn
             # directly over its own fragments as in the original
             if (style.get("stroke") or "none") != "none":
@@ -1122,11 +1141,20 @@ def scramble_flat_svg(svg_text, base_seeds=9, seed=None):
 # Step 4 — svg_to_pdf_bytes()
 # ═════════════════════════════════════════════════════════════════════════════
 
-OCG_TEXT = "OCtext"
-OCG_ART = "OCart"
+def layer_name(k):
+    """Resource name of text layer k (an optional content group)."""
+    return f"L{k}"
 
 
-def svg_to_pdf_bytes(svg_text, use_layers=False):
+def _item_layer(cls):
+    if cls and cls.startswith("txt:"):
+        return layer_name(int(cls.split(":", 1)[1]))
+    return None
+
+
+def svg_to_pdf_bytes(svg_text):
+    """Render a flat SVG to one PDF page. Fragments tagged "txt:<k>" are
+    wrapped in /OC /L<k> marked content; merge_pages() defines the groups."""
     from reportlab.pdfgen import canvas as rl_canvas
     from reportlab.lib.colors import HexColor
     from reportlab.lib.utils import ImageReader
@@ -1165,7 +1193,7 @@ def svg_to_pdf_bytes(svg_text, use_layers=False):
     layer = [None]
 
     def set_layer(name):
-        if not use_layers or layer[0] == name:
+        if layer[0] == name:
             return
         if layer[0] is not None:
             c._code.append("EMC")
@@ -1239,10 +1267,10 @@ def svg_to_pdf_bytes(svg_text, use_layers=False):
     def render(its):
         for it in its:
             if it[0] == "path":
-                set_layer(OCG_TEXT if it[3] == "txt" else OCG_ART)
+                set_layer(_item_layer(it[3]))
                 draw_path(it[1], it[2])
             elif it[0] == "image":
-                set_layer(OCG_ART)
+                set_layer(None)
                 draw_image(it[1])
             elif it[0] == "clip":
                 clip = clips.get(it[1])
@@ -1271,7 +1299,7 @@ def svg_to_pdf_bytes(svg_text, use_layers=False):
 STAGES = ("svg", "flatten", "shatter", "render")
 
 
-def process_page(input_pdf, page_index, grid_n, tmp_dir, use_layers, seed=None, progress_q=None):
+def process_page(input_pdf, page_index, grid_n, tmp_dir, n_layers, seed=None, progress_q=None):
     t0 = time.time()
 
     def stage(name):
@@ -1294,10 +1322,11 @@ def process_page(input_pdf, page_index, grid_n, tmp_dir, use_layers, seed=None, 
 
     stage("shatter")
     page_seed = None if seed is None else (seed * 1_000_003 + page_index)
-    shattered, n_frag, n_glyph, method = scramble_flat_svg(flat, base_seeds=grid_n * grid_n, seed=page_seed)
+    shattered, n_frag, n_glyph, method = scramble_flat_svg(flat, base_seeds=grid_n * grid_n, seed=page_seed,
+                                                           n_layers=n_layers)
 
     stage("render")
-    pdf = svg_to_pdf_bytes(shattered, use_layers=use_layers)
+    pdf = svg_to_pdf_bytes(shattered)
     stage("done")
     return page_index, pdf, n_frag, n_glyph, method, time.time() - t0
 
@@ -1306,7 +1335,12 @@ def process_page(input_pdf, page_index, grid_n, tmp_dir, use_layers, seed=None, 
 # Merge, optional-content layers, fingerprint
 # ═════════════════════════════════════════════════════════════════════════════
 
-def merge_pages(page_pdfs, use_layers):
+def merge_pages(page_pdfs, n_layers, link_source=None):
+    """Concatenate single-page PDFs and define the n_layers stacked text
+    layers (optional content groups, all visible) that the pages reference.
+
+    link_source: original PDF whose hyperlinks, named destinations and
+    bookmarks are carried over (see preserve_links)."""
     from pypdf import PdfReader, PdfWriter
     from pypdf.generic import (ArrayObject, DictionaryObject, NameObject, TextStringObject)
 
@@ -1314,33 +1348,270 @@ def merge_pages(page_pdfs, use_layers):
     for data in page_pdfs:
         writer.add_page(PdfReader(io.BytesIO(data)).pages[0])
 
-    if use_layers:
-        def ocg(name):
-            return writer._add_object(DictionaryObject({
-                NameObject("/Type"): NameObject("/OCG"),
-                NameObject("/Name"): TextStringObject(name),
-            }))
-        text_ref, art_ref = ocg("Text (shattered)"), ocg("Artwork")
+    if n_layers:
+        refs = [writer._add_object(DictionaryObject({
+            NameObject("/Type"): NameObject("/OCG"),
+            NameObject("/Name"): TextStringObject(f"Layer {k + 1}"),
+        })) for k in range(n_layers)]
         for page in writer.pages:
             res = page.get("/Resources")
             res = res.get_object() if res is not None else DictionaryObject()
             props = res.get("/Properties")
             props = props.get_object() if props is not None else DictionaryObject()
-            props[NameObject(f"/{OCG_TEXT}")] = text_ref
-            props[NameObject(f"/{OCG_ART}")] = art_ref
+            for k, ref in enumerate(refs):
+                props[NameObject(f"/{layer_name(k)}")] = ref
             res[NameObject("/Properties")] = props
             page[NameObject("/Resources")] = res
         writer._root_object[NameObject("/OCProperties")] = DictionaryObject({
-            NameObject("/OCGs"): ArrayObject([text_ref, art_ref]),
+            NameObject("/OCGs"): ArrayObject(refs),
             NameObject("/D"): DictionaryObject({
-                NameObject("/Order"): ArrayObject([art_ref, text_ref]),
-                NameObject("/ON"): ArrayObject([text_ref, art_ref]),
+                NameObject("/Order"): ArrayObject(refs),
+                NameObject("/ON"): ArrayObject(refs),
             }),
         })
+
+    if link_source is not None:
+        preserve_links(link_source, writer)
 
     out = io.BytesIO()
     writer.write(out)
     return out.getvalue()
+
+
+class _PageMap:
+    """Maps a point in an original page's user space to the output page.
+
+    pdftocairo renders the CropBox with /Rotate applied, placed at the
+    origin, so output = rotate(point - cropbox origin)."""
+
+    def __init__(self, page):
+        box = page.cropbox
+        self.x0, self.y0 = float(box.left), float(box.bottom)
+        self.w, self.h = float(box.width), float(box.height)
+        self.rot = page.rotation % 360
+
+    @property
+    def swaps_axes(self):
+        return self.rot in (90, 270)
+
+    def point(self, x, y):
+        u, v = x - self.x0, y - self.y0
+        w, h = self.w, self.h
+        return {0: (u, v), 90: (v, w - u), 180: (w - u, h - v), 270: (h - v, u)}.get(self.rot, (u, v))
+
+    def x_of(self, coord, from_y=False):
+        """Output x for an original x (or original y when axes swap)."""
+        x, y = (0.0, coord) if from_y else (coord, 0.0)
+        return self.point(x, y)[0]
+
+    def y_of(self, coord, from_x=False):
+        x, y = (coord, 0.0) if from_x else (0.0, coord)
+        return self.point(x, y)[1]
+
+    def rect(self, r):
+        (ax, ay), (bx, by) = self.point(float(r[0]), float(r[1])), self.point(float(r[2]), float(r[3]))
+        return min(ax, bx), min(ay, by), max(ax, bx), max(ay, by)
+
+
+def _num(v):
+    """None for a missing/null PDF number, else float."""
+    from pypdf.generic import NullObject
+    if v is None or isinstance(v, NullObject):
+        return None
+    return float(v)
+
+
+def _map_fit(typ, args, pm):
+    """Translate a destination's view (/XYZ, /FitH, ...) to output space."""
+    from pypdf.generic import Fit
+
+    args = [_num(a) for a in args]
+    sw = pm.swaps_axes
+
+    def ox(left):        # an original x-coordinate → output coordinate
+        if left is None:
+            return None
+        return pm.y_of(left, from_x=True) if sw else pm.x_of(left)
+
+    def oy(top):         # an original y-coordinate → output coordinate
+        if top is None:
+            return None
+        return pm.x_of(top, from_y=True) if sw else pm.y_of(top)
+
+    if typ == "/XYZ":
+        left, top, zoom = (args + [None] * 3)[:3]
+        if sw:
+            return Fit.xyz(oy(top), ox(left), zoom)
+        return Fit.xyz(ox(left), oy(top), zoom)
+    if typ in ("/FitH", "/FitBH"):
+        top = args[0] if args else None
+        if sw:
+            return (Fit.fit_vertically if typ == "/FitH" else Fit.fit_box_vertically)(oy(top))
+        return (Fit.fit_horizontally if typ == "/FitH" else Fit.fit_box_horizontally)(oy(top))
+    if typ in ("/FitV", "/FitBV"):
+        left = args[0] if args else None
+        if sw:
+            return (Fit.fit_horizontally if typ == "/FitV" else Fit.fit_box_horizontally)(ox(left))
+        return (Fit.fit_vertically if typ == "/FitV" else Fit.fit_box_vertically)(ox(left))
+    if typ == "/FitR" and len(args) == 4 and None not in args:
+        return Fit.fit_rectangle(*pm.rect(args))
+    if typ == "/FitB":
+        return Fit.fit_box()
+    return Fit.fit()
+
+
+def _dest_parts(dest):
+    """(type, args) of a pypdf Destination."""
+    typ = dest.get("/Type", "/Fit")
+    keys = {"/XYZ": ("/Left", "/Top", "/Zoom"), "/FitH": ("/Top",), "/FitBH": ("/Top",),
+            "/FitV": ("/Left",), "/FitBV": ("/Left",), "/FitR": ("/Left", "/Bottom", "/Right", "/Top")}
+    return typ, [dest.get(k) for k in keys.get(typ, ())]
+
+
+def preserve_links(src_pdf, writer):
+    """Carry hyperlinks, named destinations and bookmarks from the original
+    PDF over to the rebuilt pages in `writer` (same page order).
+
+    Link annotations are rebuilt from their geometry and action only, so
+    nothing else from the original annotation dictionaries is copied. URI,
+    GoTo, GoToR and Named actions are kept; JavaScript/Launch are dropped.
+
+    Returns (n_links, n_named_dests, n_bookmarks)."""
+    import logging
+    from pypdf import PdfReader
+    from pypdf.generic import (ArrayObject, Destination, DictionaryObject, FloatObject,
+                               NameObject, TextStringObject)
+
+    logging.getLogger("pypdf").setLevel(logging.ERROR)
+    reader = PdfReader(src_pdf)
+    if len(reader.pages) != len(writer.pages):
+        return 0, 0, 0
+    maps = [_PageMap(p) for p in reader.pages]
+    page_index = {p.indirect_reference.idnum: i for i, p in enumerate(reader.pages)
+                  if p.indirect_reference is not None}
+    new_refs = [p.indirect_reference for p in writer.pages]
+
+    def explicit_dest(arr):
+        """Original explicit destination array → one on the new pages."""
+        if not isinstance(arr, (list, ArrayObject)) or not arr:
+            return None
+        target = arr[0]
+        idx = page_index.get(getattr(target, "idnum", None))
+        if idx is None and isinstance(target, (int, float)) and not isinstance(target, bool):
+            idx = int(target)        # remote-style page number
+        if idx is None or not 0 <= idx < len(new_refs):
+            return None
+        fit = _map_fit(str(arr[1]) if len(arr) > 1 else "/Fit", list(arr[2:]), maps[idx])
+        return ArrayObject([new_refs[idx], NameObject(fit.fit_type)] + list(fit.fit_args))
+
+    def dest_value(d):
+        d = d.get_object() if hasattr(d, "get_object") else d
+        if isinstance(d, NameObject):            # /Dests-dictionary style name
+            return TextStringObject(str(d)[1:])
+        if isinstance(d, str):                   # name-tree string: kept as is
+            return TextStringObject(d)
+        return explicit_dest(d)
+
+    # 1) named destinations, re-pointed at the new pages
+    n_named = 0
+    for name, dest in reader.named_destinations.items():
+        idx = reader.get_destination_page_number(dest)
+        if idx is None or not 0 <= idx < len(new_refs):
+            continue
+        typ, args = _dest_parts(dest)
+        writer.add_named_destination_object(
+            Destination(str(name), new_refs[idx], _map_fit(typ, args, maps[idx])))
+        n_named += 1
+
+    # 2) link annotations
+    n_links = 0
+    for idx, page in enumerate(reader.pages):
+        annots = []
+        for a in page.get("/Annots") or []:
+            a = a.get_object()
+            if a.get("/Subtype") != "/Link" or "/Rect" not in a:
+                continue
+            new = DictionaryObject({
+                NameObject("/Type"): NameObject("/Annot"),
+                NameObject("/Subtype"): NameObject("/Link"),
+                NameObject("/Rect"): ArrayObject([FloatObject(round(v, 4)) for v in maps[idx].rect(a["/Rect"])]),
+            })
+            for key in ("/Border", "/C", "/H", "/BS", "/F"):
+                if key in a:
+                    new[NameObject(key)] = a[key]
+            if "/QuadPoints" in a:
+                q = [float(v) for v in a["/QuadPoints"]]
+                pts = [maps[idx].point(q[i], q[i + 1]) for i in range(0, len(q) - 1, 2)]
+                new[NameObject("/QuadPoints")] = ArrayObject(
+                    [FloatObject(round(c, 4)) for p in pts for c in p])
+            if "/Dest" in a:
+                d = dest_value(a["/Dest"])
+                if d is None:
+                    continue
+                new[NameObject("/Dest")] = d
+            elif "/A" in a:
+                act = a["/A"].get_object()
+                kind = act.get("/S")
+                if kind == "/URI" and "/URI" in act:
+                    new_act = {NameObject("/URI"): act["/URI"]}
+                elif kind == "/GoTo" and "/D" in act:
+                    d = dest_value(act["/D"])
+                    if d is None:
+                        continue
+                    new_act = {NameObject("/D"): d}
+                elif kind == "/GoToR" and "/F" in act:
+                    new_act = {k: act[k] for k in (NameObject("/F"), NameObject("/D"), NameObject("/NewWindow"))
+                               if k in act}
+                elif kind == "/Named" and "/N" in act:
+                    new_act = {NameObject("/N"): act["/N"]}
+                else:
+                    continue
+                new_act[NameObject("/S")] = kind
+                new_act[NameObject("/Type")] = NameObject("/Action")
+                new[NameObject("/A")] = DictionaryObject(new_act)
+            else:
+                continue
+            annots.append(writer._add_object(new))
+        if annots:
+            out_page = writer.pages[idx]
+            existing = out_page.get("/Annots")
+            arr = ArrayObject(list(existing.get_object())) if existing is not None else ArrayObject()
+            arr.extend(annots)
+            out_page[NameObject("/Annots")] = arr
+            n_links += len(annots)
+
+    # 3) bookmarks (document outline)
+    n_marks = 0
+
+    def build(items, parent):
+        nonlocal n_marks
+        last = None
+        for it in items:
+            if isinstance(it, list):
+                if last is not None:
+                    build(it, last)
+                continue
+            idx = reader.get_destination_page_number(it)
+            if idx is None or not 0 <= idx < len(new_refs):
+                continue
+            typ, args = _dest_parts(it)
+            flags = int(it.get("/F", 0) or 0)
+            color = it.get("/C")
+            last = writer.add_outline_item(
+                str(it.title), idx, parent=parent, fit=_map_fit(typ, args, maps[idx]),
+                color=tuple(float(c) for c in color) if color is not None and len(color) == 3 else None,
+                italic=bool(flags & 1), bold=bool(flags & 2),
+                is_open=int(it.get("/Count", 0) or 0) > 0)
+            n_marks += 1
+
+    try:
+        build(reader.outline, None)
+    except Exception:  # a malformed outline must not cost the links
+        pass
+    mode = reader.trailer["/Root"].get("/PageMode")
+    if n_marks and mode is not None:
+        writer._root_object[NameObject("/PageMode")] = NameObject(str(mode))
+    return n_links, n_named, n_marks
 
 
 FP_BITS = 32
@@ -1482,6 +1753,9 @@ def run(args):
     if n_pages == 0:
         console.print("[red]✘ PDF has no pages.[/]")
         return 1
+    n_layers = args.layers
+    if n_layers is None:
+        n_layers = random.Random(args.seed).randint(LAYERS_MIN, LAYERS_MAX)
     workers = max(1, min(args.workers or os.cpu_count() or 1, n_pages))
 
     status = {i: {"stage": "queued", "method": "", "frags": None, "time": None} for i in range(n_pages)}
@@ -1516,7 +1790,7 @@ def run(args):
         q = mgr.Queue()
         with Live(Group(progress, table()), console=console, refresh_per_second=8) as live, \
                 ProcessPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(process_page, inp, i, args.grid, tmp, args.layers, args.seed, q): i
+            futs = {ex.submit(process_page, inp, i, args.grid, tmp, n_layers, args.seed, q): i
                     for i in range(n_pages)}
             pending = set(futs)
             while pending:
@@ -1550,7 +1824,11 @@ def run(args):
                 if pending:
                     time.sleep(0.1)
 
-    merged = merge_pages([results[i] for i in range(n_pages)], args.layers)
+    try:
+        merged = merge_pages([results[i] for i in range(n_pages)], n_layers, link_source=inp)
+    except Exception as e:  # never lose the scrambled output over link copying
+        console.print(f"[yellow]! Could not preserve hyperlinks ({type(e).__name__}: {e}).[/]")
+        merged = merge_pages([results[i] for i in range(n_pages)], n_layers)
     fp_hex = None
     if args.fingerprint:
         fp = random.getrandbits(FP_BITS)
@@ -1562,6 +1840,7 @@ def run(args):
     console.print(f"\n[bold green]✔ Done[/] → {args.output}")
     console.print(f"  Pages           : {n_pages}")
     console.print(f"  Total fragments : {total_frags:,}")
+    console.print(f"  Layers          : {n_layers or 'off'}")
     console.print(f"  Input size      : {os.path.getsize(inp) / 1024:,.1f} KB")
     console.print(f"  Output size     : {os.path.getsize(outp) / 1024:,.1f} KB")
     if fp_hex:
@@ -1578,8 +1857,9 @@ def main(argv=None):
     ap.add_argument("--grid", type=int, default=3,
                     help="seed grid size: each glyph gets up to N×N fragments (default 3 → 9)")
     ap.add_argument("--workers", type=int, default=None, help="parallel workers (default: CPU count)")
-    ap.add_argument("--layers", action="store_true",
-                    help="put shattered text and artwork on separate toggleable PDF layers (OCGs)")
+    ap.add_argument("--layers", type=int, default=None, metavar="N",
+                    help=f"spread text fragments across N stacked PDF layers "
+                         f"(default: random {LAYERS_MIN}-{LAYERS_MAX}; 0 disables)")
     ap.add_argument("--fingerprint", action="store_true", help="embed an invisible 32-bit fingerprint")
     ap.add_argument("--seed", type=int, default=None, help="random seed for reproducible shattering")
     ap.add_argument("--extract-fingerprint", metavar="PDF", help="read the fingerprint from a PDF")
@@ -1594,6 +1874,8 @@ def main(argv=None):
         return 0
     if not args.input or not args.output:
         ap.error("input and output PDFs are required")
+    if args.layers is not None and not (args.layers == 0 or 2 <= args.layers <= 64):
+        ap.error("--layers must be 0 or between 2 and 64")
     if args.grid < 1:
         ap.error("--grid must be >= 1")
     return run(args)
