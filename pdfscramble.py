@@ -6,6 +6,7 @@ while leaving images, plots and diagrams intact. Optionally embeds an invisible
 
 Usage:
     pdfscramble <input.pdf> <output.pdf> [--grid N] [--workers N] [--layers N]
+                [--image-ppi N] [--jpeg-quality Q]
                 [--fingerprint] [--seed N]
     pdfscramble --extract-fingerprint <pdf>
 
@@ -1152,13 +1153,66 @@ def _item_layer(cls):
     return None
 
 
-def svg_to_pdf_bytes(svg_text):
-    """Render a flat SVG to one PDF page. Fragments tagged "txt:<k>" are
-    wrapped in /OC /L<k> marked content; merge_pages() defines the groups."""
-    from reportlab.pdfgen import canvas as rl_canvas
-    from reportlab.lib.colors import HexColor
+PHOTO_MIN_COLORS = 16384      # lossless images with more colours are treated as photos
+
+
+def prepare_image(raw, mime, disp_w_pt, disp_h_pt, max_ppi=300, jpeg_quality=85):
+    """Return (ImageReader, mask) for an embedded image, compressing photos.
+
+    - JPEGs already at <= max_ppi are embedded byte-for-byte (no re-encode).
+    - Photos above max_ppi are downsampled to max_ppi and saved as JPEG.
+    - Lossless photo-like images (many colours, no alpha) become JPEG.
+    - Everything else (plots, line art, transparency) stays lossless.
+    Returns None if the image can't be decoded."""
     from reportlab.lib.utils import ImageReader
     from PIL import Image
+
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+    except Exception:
+        return None
+    is_jpeg = mime == "image/jpeg" or img.format == "JPEG"
+    has_alpha = "A" in img.getbands() or "transparency" in img.info
+
+    scale = 1.0
+    if max_ppi and disp_w_pt > 0 and disp_h_pt > 0:
+        scale = min(1.0, max_ppi * disp_w_pt / 72 / img.width, max_ppi * disp_h_pt / 72 / img.height)
+    downsample = scale < 0.95      # don't resample for a few percent
+
+    if is_jpeg and not downsample and img.mode in ("RGB", "L", "CMYK"):
+        return ImageReader(io.BytesIO(raw)), None
+
+    photo = is_jpeg
+    if not photo and not has_alpha:
+        thumb = img.convert("RGB")
+        thumb.thumbnail((256, 256))
+        colors = thumb.getcolors(256 * 256)       # None: more colours than pixels allow
+        photo = colors is None or len(colors) >= PHOTO_MIN_COLORS
+
+    if downsample and (photo or img.width * img.height > 4_000_000):
+        size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+        img = img.resize(size, Image.LANCZOS)
+
+    if photo and not has_alpha:
+        img = img.convert("L" if img.mode in ("L", "1") else "RGB")
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=jpeg_quality, optimize=True,
+                 subsampling=0 if jpeg_quality >= 90 else 2)
+        return ImageReader(io.BytesIO(buf.getvalue())), None
+
+    if img.mode not in ("RGB", "RGBA", "L"):
+        img = img.convert("RGBA" if has_alpha else "RGB")
+    return ImageReader(img), ("auto" if img.mode == "RGBA" else None)
+
+
+def svg_to_pdf_bytes(svg_text, max_ppi=300, jpeg_quality=85):
+    """Render a flat SVG to one PDF page. Fragments tagged "txt:<k>" are
+    wrapped in /OC /L<k> marked content; merge_pages() defines the groups."""
+    from reportlab import rl_config
+    rl_config.useA85 = 0          # binary streams: ASCII85 adds 25% to everything
+    from reportlab.pdfgen import canvas as rl_canvas
+    from reportlab.lib.colors import HexColor
 
     root, clips, items = read_flat_svg(svg_text)
     w_pt, h_pt, (vbx, vby, vbw, vbh) = svg_page_size(root)
@@ -1239,29 +1293,30 @@ def svg_to_pdf_bytes(svg_text):
 
     def draw_image(a):
         href = a["href"]
-        m = re.match(r"data:[^;,]*(;base64)?,(.*)", href, re.S)
+        m = re.match(r"data:([^;,]*)(;base64)?,(.*)", href, re.S)
         if not m or a["width"] <= 0 or a["height"] <= 0:
             return
         try:
-            raw = base64.b64decode(m.group(2)) if m.group(1) else m.group(2).encode()
-            img = Image.open(io.BytesIO(raw))
-            img.load()
+            raw = base64.b64decode(m.group(3)) if m.group(2) else m.group(3).encode()
         except Exception:
             return
-        if img.mode not in ("RGB", "RGBA", "L"):
-            img = img.convert("RGBA" if "A" in img.getbands() or "transparency" in img.info else "RGB")
-        c.saveState()
-        if a["opacity"] < 1:
-            c.setFillAlpha(a["opacity"])
         # page map (SVG viewBox -> PDF) composed with the image's own matrix
         page = (sx, 0, 0, -sy, -vbx * sx, h_pt + vby * sy)
         full = mat_mul(page, a["matrix"])
+        disp_w = a["width"] * math.hypot(full[0], full[1])
+        disp_h = a["height"] * math.hypot(full[2], full[3])
+        prepared = prepare_image(raw, m.group(1), disp_w, disp_h, max_ppi, jpeg_quality)
+        if prepared is None:
+            return
+        reader, mask = prepared
+        c.saveState()
+        if a["opacity"] < 1:
+            c.setFillAlpha(a["opacity"])
         c.transform(*full)
         # image local space is y-down: flip around the image's own box
         c.translate(a["x"], a["y"] + a["height"])
         c.scale(1, -1)
-        c.drawImage(ImageReader(img), 0, 0, a["width"], a["height"],
-                    mask="auto" if img.mode == "RGBA" else None)
+        c.drawImage(reader, 0, 0, a["width"], a["height"], mask=mask)
         c.restoreState()
 
     def render(its):
@@ -1299,7 +1354,8 @@ def svg_to_pdf_bytes(svg_text):
 STAGES = ("svg", "flatten", "shatter", "render")
 
 
-def process_page(input_pdf, page_index, grid_n, tmp_dir, n_layers, seed=None, progress_q=None):
+def process_page(input_pdf, page_index, grid_n, tmp_dir, n_layers, seed=None, progress_q=None,
+                 max_ppi=300, jpeg_quality=85):
     t0 = time.time()
 
     def stage(name):
@@ -1326,7 +1382,7 @@ def process_page(input_pdf, page_index, grid_n, tmp_dir, n_layers, seed=None, pr
                                                            n_layers=n_layers)
 
     stage("render")
-    pdf = svg_to_pdf_bytes(shattered)
+    pdf = svg_to_pdf_bytes(shattered, max_ppi=max_ppi, jpeg_quality=jpeg_quality)
     stage("done")
     return page_index, pdf, n_frag, n_glyph, method, time.time() - t0
 
@@ -1790,7 +1846,8 @@ def run(args):
         q = mgr.Queue()
         with Live(Group(progress, table()), console=console, refresh_per_second=8) as live, \
                 ProcessPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(process_page, inp, i, args.grid, tmp, n_layers, args.seed, q): i
+            futs = {ex.submit(process_page, inp, i, args.grid, tmp, n_layers, args.seed, q,
+                               args.image_ppi, args.jpeg_quality): i
                     for i in range(n_pages)}
             pending = set(futs)
             while pending:
@@ -1860,6 +1917,10 @@ def main(argv=None):
     ap.add_argument("--layers", type=int, default=None, metavar="N",
                     help=f"spread text fragments across N stacked PDF layers "
                          f"(default: random {LAYERS_MIN}-{LAYERS_MAX}; 0 disables)")
+    ap.add_argument("--image-ppi", type=int, default=300, metavar="N",
+                    help="downsample photos above N pixels per inch on the page (default 300; 0 = never)")
+    ap.add_argument("--jpeg-quality", type=int, default=85, metavar="Q",
+                    help="JPEG quality for recompressed photos, 1-95 (default 85)")
     ap.add_argument("--fingerprint", action="store_true", help="embed an invisible 32-bit fingerprint")
     ap.add_argument("--seed", type=int, default=None, help="random seed for reproducible shattering")
     ap.add_argument("--extract-fingerprint", metavar="PDF", help="read the fingerprint from a PDF")
@@ -1876,6 +1937,10 @@ def main(argv=None):
         ap.error("input and output PDFs are required")
     if args.layers is not None and not (args.layers == 0 or 2 <= args.layers <= 64):
         ap.error("--layers must be 0 or between 2 and 64")
+    if not 1 <= args.jpeg_quality <= 95:
+        ap.error("--jpeg-quality must be between 1 and 95")
+    if args.image_ppi < 0:
+        ap.error("--image-ppi must be >= 0")
     if args.grid < 1:
         ap.error("--grid must be >= 1")
     return run(args)
